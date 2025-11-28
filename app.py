@@ -1,6 +1,7 @@
 import io
 import json
 import base64
+from datetime import date, timedelta
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
@@ -9,24 +10,20 @@ from openai import OpenAI
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import Flow
+from google.auth.transport.requests import Request
 
 
 # ---------------------------------------------------------------------
-# Utilitaires Streamlit pour les query params (compat anciens / nouveaux)
+# Utilitaires Streamlit pour les query params
 # ---------------------------------------------------------------------
 
 
 def get_query_param(name: str) -> Optional[str]:
-    """
-    Récupère un paramètre d'URL (ex: code, state), compatible
-    avec st.query_params (nouveau) et st.experimental_get_query_params (ancien).
-    """
-    # Nouveaux Streamlit
+    """Récupère un paramètre d'URL (compatible anciennes / nouvelles versions)."""
     try:
         params = st.query_params
         value = params.get(name)
     except Exception:
-        # Anciens Streamlit
         params = st.experimental_get_query_params()
         value = params.get(name)
 
@@ -36,13 +33,10 @@ def get_query_param(name: str) -> Optional[str]:
 
 
 def clear_query_params():
-    """
-    Tente de nettoyer les query params dans l'URL (optionnel).
-    """
+    """Nettoie les query params de l'URL (optionnel)."""
     try:
         st.query_params.clear()
     except Exception:
-        # Compat anciennes versions
         try:
             st.experimental_set_query_params()
         except Exception:
@@ -68,7 +62,7 @@ def get_google_oauth_config() -> Dict[str, Any]:
     if not cfg:
         st.error(
             "Section [google_oauth] manquante dans les secrets Streamlit.\n\n"
-            "Va dans 'Manage app' → 'Settings' → 'Secrets' et ajoute :\n\n"
+            "Dans 'Manage app' → 'Settings' → 'Secrets', ajoute :\n\n"
             "[google_oauth]\n"
             'client_id = "xxx.apps.googleusercontent.com"\n'
             'client_secret = "xxxxx"\n'
@@ -79,10 +73,7 @@ def get_google_oauth_config() -> Dict[str, Any]:
 
 
 def build_flow(redirect_uri: str) -> Flow:
-    """
-    Construit un Flow OAuth Web à partir des infos en secrets.
-    On n'utilise PLUS de credentials.json local.
-    """
+    """Construit un Flow OAuth Web à partir des infos en secrets."""
     oauth_cfg = get_google_oauth_config()
     client_id = oauth_cfg["client_id"]
     client_secret = oauth_cfg["client_secret"]
@@ -106,9 +97,7 @@ def build_flow(redirect_uri: str) -> Flow:
 
 
 def get_credentials_from_session() -> Optional[Credentials]:
-    """
-    Récupère les credentials depuis la session Streamlit, si déjà authentifié.
-    """
+    """Récupère les credentials depuis la session Streamlit, si déjà authentifié."""
     creds_json = st.session_state.get("google_credentials")
     if not creds_json:
         return None
@@ -118,10 +107,7 @@ def get_credentials_from_session() -> Optional[Credentials]:
 
 
 def store_credentials_in_session(creds: Credentials):
-    """
-    Stocke les credentials en JSON dans st.session_state.
-    (Rien n'est écrit sur disque, tout reste en mémoire côté serveur.)
-    """
+    """Stocke les credentials en JSON dans st.session_state."""
     info = {
         "token": creds.token,
         "refresh_token": getattr(creds, "refresh_token", None),
@@ -136,21 +122,30 @@ def store_credentials_in_session(creds: Credentials):
 def ensure_logged_in_and_get_credentials() -> Optional[Credentials]:
     """
     Gère toute la logique OAuth Web :
-    - Si pas connecté → affiche un bouton 'Se connecter avec Google'
-    - Si on revient de Google avec ?code=... → échange le code contre un token
-    - Stocke les credentials en session
-    - Renvoie les credentials utilisables pour l'API Gmail
+    - Si déjà connecté → rafraîchit le token si besoin, puis renvoie les creds
+    - Sinon → lance le flow OAuth (lien 'Se connecter avec Google')
     """
+    # 1) Déjà des credentials en session ?
     creds = get_credentials_from_session()
-    if creds and creds.valid:
-        return creds
+    if creds:
+        # Token expiré ? → on tente un refresh silencieux
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                store_credentials_in_session(creds)
+            except Exception:
+                creds = None  # on repassera par la connexion complète
 
+        if creds and creds.valid:
+            return creds
+
+    # 2) Pas de creds valides → on voit si on revient d'un code OAuth
     oauth_cfg = get_google_oauth_config()
     redirect_uri = oauth_cfg["redirect_uri"]
 
     code = get_query_param("code")
 
-    # 1) Pas de code → on propose de se connecter
+    # Pas de code → on affiche le lien de connexion Google
     if not code:
         flow = build_flow(redirect_uri)
         auth_url, state = flow.authorization_url(
@@ -164,7 +159,7 @@ def ensure_logged_in_and_get_credentials() -> Optional[Credentials]:
         st.link_button("🔐 Se connecter avec Google", auth_url)
         st.stop()
 
-    # 2) On revient de Google avec un code → on échange contre un token
+    # On revient de Google avec un code → on échange contre un token
     saved_state = st.session_state.get("oauth_state")
     flow = build_flow(redirect_uri)
     if saved_state:
@@ -179,17 +174,13 @@ def ensure_logged_in_and_get_credentials() -> Optional[Credentials]:
     creds = flow.credentials
     store_credentials_in_session(creds)
 
-    # Nettoyage des query params (enlève ?code=... de l'URL)
     clear_query_params()
 
     return creds
 
 
 def get_gmail_service():
-    """
-    Renvoie un service Gmail authentifié, en forçant l'auth si besoin.
-    100% web, pas de fichier local.
-    """
+    """Renvoie un service Gmail authentifié (100 % web, pas de fichier local)."""
     creds = ensure_logged_in_and_get_credentials()
     if not creds:
         st.stop()
@@ -197,10 +188,7 @@ def get_gmail_service():
 
 
 def list_messages(service, query: str = "", max_results: int = 20) -> List[Dict[str, Any]]:
-    """
-    Liste des messages (id + infos) selon une requête Gmail.
-    Ex: "is:unread", "from:client", "subject:TVA"
-    """
+    """Liste des messages (id + infos) selon une requête Gmail."""
     results = (
         service.users()
         .messages()
@@ -239,12 +227,7 @@ def list_messages(service, query: str = "", max_results: int = 20) -> List[Dict[
 
 
 def get_email_detail(service, message_id: str) -> Dict[str, Any]:
-    """
-    Détail complet d'un email :
-    - Sujet, expéditeur, date
-    - Snippet
-    - Corps texte (text/plain si dispo)
-    """
+    """Détail complet d'un email (sujet, from, date, snippet, corps texte)."""
     msg = (
         service.users()
         .messages()
@@ -257,7 +240,7 @@ def get_email_detail(service, message_id: str) -> Dict[str, Any]:
 
     subject = header_map.get("Subject", "")
     sender = header_map.get("From", "")
-    date = header_map.get("Date", "")
+    date_hdr = header_map.get("Date", "")
     snippet = msg.get("snippet", "")
 
     body = ""
@@ -284,7 +267,7 @@ def get_email_detail(service, message_id: str) -> Dict[str, Any]:
         "id": message_id,
         "subject": subject,
         "from": sender,
-        "date": date,
+        "date": date_hdr,
         "snippet": snippet,
         "body": body,
     }
@@ -348,9 +331,8 @@ def draft_reply(
         f"Sujet du mail reçu : {email_subject}\n\n"
         f"Contenu du mail reçu :\n{email_body}\n\n"
         f"Rédige une réponse en {language}, avec un ton {tone}, clair et structuré, "
-        f"en restant réaliste (ne promets pas des choses impossibles). "
-        f"Ne commence pas directement par 'Bonjour' dans ton texte, "
-        f"la formule de politesse sera ajoutée après."
+        f"en restant réaliste. "
+        f"Ne commence pas directement par 'Bonjour', je rajouterai la formule de politesse."
     )
 
     completion = client.chat.completions.create(
@@ -429,19 +411,26 @@ Les tokens Google restent en mémoire de session (pas de fichier local).
 """
 )
 
-# --- Auth Google obligatoire avant de continuer ---
+# --- Connexion Gmail (obligatoire une fois, puis refresh silencieux) ---
 gmail_service = get_gmail_service()
 
 # ---------------- Sidebar : options ----------------
 
 st.sidebar.header("🔧 Options Gmail")
 
-default_query = "is:unread"
-query = st.sidebar.text_input(
+# Plus de 'is:unread' par défaut → requête vide
+user_query = st.sidebar.text_input(
     "Requête Gmail (syntaxe Gmail search)",
-    value=default_query,
-    help="Exemples : is:unread, from:client, subject:TVA, has:attachment",
+    value="",
+    help="Exemples : from:client, subject:TVA, has:attachment, etc.",
 )
+
+# Filtre 'depuis la date'
+default_start = date.today() - timedelta(days=30)
+start_date = st.sidebar.date_input(
+    "À partir du (inclus)", value=default_start, help="Filtre les mails après cette date."
+)
+
 max_results = st.sidebar.slider("Nombre de mails à charger", 1, 50, 10)
 
 refresh = st.sidebar.button("🔄 Charger / Rafraîchir les mails")
@@ -449,11 +438,25 @@ refresh = st.sidebar.button("🔄 Charger / Rafraîchir les mails")
 if "email_list" not in st.session_state:
     st.session_state.email_list = []
 
+# ---------------- Construction de la requête Gmail ----------------
+
+def build_gmail_query() -> str:
+    q = user_query.strip()
+    if start_date:
+        date_str = start_date.strftime("%Y/%m/%d")
+        if q:
+            q = f"{q} after:{date_str}"
+        else:
+            q = f"after:{date_str}"
+    return q
+
+
 # ---------------- Chargement des mails ----------------
 
 if refresh:
     try:
-        with st.spinner("Récupération des mails depuis Gmail..."):
+        query = build_gmail_query()
+        with st.spinner(f"Récupération des mails depuis Gmail (q='{query}')..."):
             st.session_state.email_list = list_messages(
                 gmail_service, query=query, max_results=max_results
             )
@@ -549,9 +552,9 @@ st.markdown(
 Enregistre un message vocal pour donner des instructions à l'assistant.
 
 Exemples :
-- *"Résume-moi les trois derniers mails non lus."*
-- *"Propose une réponse au dernier mail de Mme Dupont concernant la TVA."*
-- *"Liste les urgences dans ma boîte de réception."*
+- "Résume-moi les trois derniers mails de tel client."
+- "Propose une réponse au dernier mail parlant de TVA."
+- "Liste les urgences dans ma boîte de réception."
 """
 )
 
