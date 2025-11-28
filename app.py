@@ -11,8 +11,6 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-from audiorecorder import audiorecorder
-
 
 # ---------------------------------------------------------------------
 # CONFIG GMAIL
@@ -28,8 +26,6 @@ def get_gmail_service():
     Crée un client Gmail authentifié (OAuth local).
     - Si token.json existe → on l'utilise
     - Sinon → lancement du flux OAuth dans le navigateur
-
-    Basé sur le quickstart officiel Gmail API (Python).
     """
     creds: Optional[Credentials] = None
 
@@ -41,13 +37,13 @@ def get_gmail_service():
             # Refresh silencieux
             creds.refresh(Request())
         else:
-            # 1ère autorisation : ouvre le navigateur
+            # 1ère autorisation : ouvre le navigateur (en local)
             flow = InstalledAppFlow.from_client_secrets_file(
                 CREDENTIALS_FILE, SCOPES
             )
             creds = flow.run_local_server(port=0)
 
-        # Sauvegarde pour les prochaines fois
+        # Sauvegarde pour les prochains lancements
         with open(TOKEN_FILE, "w") as token:
             token.write(creds.to_json())
 
@@ -247,27 +243,26 @@ def draft_reply(
 
 def transcribe_audio(audio_bytes: bytes, language: str = "fr") -> str:
     """
-    Transcrit un enregistrement vocal (wav) en texte avec Whisper / transcription OpenAI.
+    Transcrit un enregistrement vocal (wav/mp3/ogg) en texte avec Whisper (OpenAI).
 
     On utilise BytesIO + .name pour être compatible avec l'API.
     """
     client = get_openai_client()
 
     audio_file = io.BytesIO(audio_bytes)
-    audio_file.name = "message.wav"  # important pour l'API (extension reconnue)
+    audio_file.name = "message.wav"  # nom symbolique (extension reconnue)
 
-    # Whisper-1 (modèle classique de transcription)
     transcript = client.audio.transcriptions.create(
         model="whisper-1",
         file=audio_file,
-        response_format="text",  # la réponse est une simple string
+        response_format="text",  # renvoie une simple string
     )
 
-    # Si response_format="text", transcript est déjà une string.
+    # Si response_format="text", transcript est déjà une string
     if isinstance(transcript, str):
         return transcript
 
-    # fallback si c'est un objet
+    # fallback si jamais c'est un objet
     return getattr(transcript, "text", str(transcript))
 
 
@@ -307,23 +302,22 @@ def interpret_voice_instruction(transcribed_text: str) -> str:
 
 st.set_page_config(page_title="Assistant Gmail IA", page_icon="📧", layout="wide")
 
-st.title("📧 Assistant Gmail IA (local)")
+st.title("📧 Assistant Gmail IA (local / Streamlit)")
 
 st.markdown(
     """
-Cet outil tourne **en local** sur ta machine.
+Cet outil te permet de piloter ta boîte Gmail avec l'IA :
 
-Fonctionnalités :
 - Connexion à ton Gmail via OAuth (lecture seule)
 - Filtrage des mails avec la syntaxe de recherche Gmail
-- Affichage détaillé du mail
+- Affichage détaillé d'un mail
 - Résumé automatique par IA
-- Proposition de brouillon de réponse par IA
+- Proposition de brouillon de réponse
 - 🎙 Enregistrement d'un message vocal et interprétation par l'IA
 
 ⚠️ Données :
-- Emails récupérés uniquement depuis Google (Gmail API)
-- Seul le contenu que tu demandes explicitement à traiter est envoyé à OpenAI
+- Emails récupérés uniquement via l'API Gmail
+- Seul le contenu que tu demandes à traiter est envoyé à OpenAI
 """
 )
 
@@ -452,20 +446,21 @@ Exemples :
 - *"Propose une réponse au dernier mail de Mme Dupont concernant la TVA."*
 - *"Liste les urgences dans ma boîte de réception."*
 
-💡 L'enregistrement se fait dans ton navigateur (micro).
+💡 L'enregistrement se fait via le micro de ton navigateur.
 """
 )
 
-audio = audiorecorder("🔴 Enregistrer", "⏹️ Stop")
+audio_file = st.audio_input("Enregistre un message vocal")
 
-if len(audio) > 0:
-    # Lecture de l'audio dans le frontend
-    st.audio(audio.tobytes(), format="audio/wav")
-    st.success("Enregistrement terminé. Tu peux maintenant lancer la transcription.")
+if audio_file is not None:
+    # Lecture de l'audio dans l'interface
+    st.audio(audio_file)
 
     if st.button("🧠 Transcrire et envoyer à l'assistant"):
+        audio_bytes = audio_file.getvalue()
+
         with st.spinner("Transcription du message vocal..."):
-            transcript_text = transcribe_audio(audio.tobytes())
+            transcript_text = transcribe_audio(audio_bytes)
 
         st.markdown("#### Texte transcrit")
         st.write(transcript_text)
