@@ -1,0 +1,13 @@
+# Fichiers sensibles à ne jamais pousser sur GitHub
+credentials.json
+token.json
+
+# Config locale Streamlit
+.streamlit/secrets.toml
+
+# Classique Python
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
