@@ -1,4 +1,3 @@
-import os
 import io
 import json
 import base64
@@ -12,55 +11,195 @@ from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import Flow
 
 
+# ---------------------------------------------------------------------
+# Utilitaires Streamlit pour les query params (compat anciens / nouveaux)
+# ---------------------------------------------------------------------
+
+
+def get_query_param(name: str) -> Optional[str]:
+    """
+    Récupère un paramètre d'URL (ex: code, state), compatible
+    avec st.query_params (nouveau) et st.experimental_get_query_params (ancien).
+    """
+    # Nouveaux Streamlit
+    try:
+        params = st.query_params
+        value = params.get(name)
+    except Exception:
+        # Anciens Streamlit
+        params = st.experimental_get_query_params()
+        value = params.get(name)
+
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def clear_query_params():
+    """
+    Tente de nettoyer les query params dans l'URL (optionnel).
+    """
+    try:
+        st.query_params.clear()
+    except Exception:
+        # Compat anciennes versions
+        try:
+            st.experimental_set_query_params()
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------
-# CONFIG GMAIL
+# CONFIG GMAIL (100% WEB, via secrets)
 # ---------------------------------------------------------------------
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-TOKEN_FILE = "token.json"
-CREDENTIALS_FILE = "credentials.json"
+
+
+def get_google_oauth_config() -> Dict[str, Any]:
+    """
+    Lit la config OAuth depuis les secrets Streamlit :
+    [google_oauth]
+    client_id = "..."
+    client_secret = "..."
+    redirect_uri = "https://ton-app.streamlit.app/"
+    """
+    cfg = st.secrets.get("google_oauth", None)
+    if not cfg:
+        st.error(
+            "Section [google_oauth] manquante dans les secrets Streamlit.\n\n"
+            "Va dans 'Manage app' → 'Settings' → 'Secrets' et ajoute :\n\n"
+            "[google_oauth]\n"
+            'client_id = "xxx.apps.googleusercontent.com"\n'
+            'client_secret = "xxxxx"\n'
+            'redirect_uri = "https://ton-app.streamlit.app/"\n'
+        )
+        st.stop()
+    return cfg
+
+
+def build_flow(redirect_uri: str) -> Flow:
+    """
+    Construit un Flow OAuth Web à partir des infos en secrets.
+    On n'utilise PLUS de credentials.json local.
+    """
+    oauth_cfg = get_google_oauth_config()
+    client_id = oauth_cfg["client_id"]
+    client_secret = oauth_cfg["client_secret"]
+
+    client_config = {
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [redirect_uri],
+        }
+    }
+
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        redirect_uri=redirect_uri,
+    )
+    return flow
+
+
+def get_credentials_from_session() -> Optional[Credentials]:
+    """
+    Récupère les credentials depuis la session Streamlit, si déjà authentifié.
+    """
+    creds_json = st.session_state.get("google_credentials")
+    if not creds_json:
+        return None
+
+    data = json.loads(creds_json)
+    return Credentials.from_authorized_user_info(data, SCOPES)
+
+
+def store_credentials_in_session(creds: Credentials):
+    """
+    Stocke les credentials en JSON dans st.session_state.
+    (Rien n'est écrit sur disque, tout reste en mémoire côté serveur.)
+    """
+    info = {
+        "token": creds.token,
+        "refresh_token": getattr(creds, "refresh_token", None),
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": list(creds.scopes),
+    }
+    st.session_state["google_credentials"] = json.dumps(info)
+
+
+def ensure_logged_in_and_get_credentials() -> Optional[Credentials]:
+    """
+    Gère toute la logique OAuth Web :
+    - Si pas connecté → affiche un bouton 'Se connecter avec Google'
+    - Si on revient de Google avec ?code=... → échange le code contre un token
+    - Stocke les credentials en session
+    - Renvoie les credentials utilisables pour l'API Gmail
+    """
+    creds = get_credentials_from_session()
+    if creds and creds.valid:
+        return creds
+
+    oauth_cfg = get_google_oauth_config()
+    redirect_uri = oauth_cfg["redirect_uri"]
+
+    code = get_query_param("code")
+
+    # 1) Pas de code → on propose de se connecter
+    if not code:
+        flow = build_flow(redirect_uri)
+        auth_url, state = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
+        st.session_state["oauth_state"] = state
+
+        st.info("Tu n'es pas encore connecté à ton compte Google.")
+        st.link_button("🔐 Se connecter avec Google", auth_url)
+        st.stop()
+
+    # 2) On revient de Google avec un code → on échange contre un token
+    saved_state = st.session_state.get("oauth_state")
+    flow = build_flow(redirect_uri)
+    if saved_state:
+        flow.state = saved_state
+
+    try:
+        flow.fetch_token(code=code)
+    except Exception as e:
+        st.error(f"Erreur pendant l'échange du code OAuth : {e}")
+        st.stop()
+
+    creds = flow.credentials
+    store_credentials_in_session(creds)
+
+    # Nettoyage des query params (enlève ?code=... de l'URL)
+    clear_query_params()
+
+    return creds
 
 
 def get_gmail_service():
     """
-    Crée un client Gmail authentifié (OAuth local).
-    - Si token.json existe → on l'utilise
-    - Sinon → lancement du flux OAuth dans le navigateur
+    Renvoie un service Gmail authentifié, en forçant l'auth si besoin.
+    100% web, pas de fichier local.
     """
-    creds: Optional[Credentials] = None
-
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            # Refresh silencieux
-            creds.refresh(Request())
-        else:
-            # 1ère autorisation : ouvre le navigateur (en local)
-            flow = InstalledAppFlow.from_client_secrets_file(
-                CREDENTIALS_FILE, SCOPES
-            )
-            creds = flow.run_local_server(port=0)
-
-        # Sauvegarde pour les prochains lancements
-        with open(TOKEN_FILE, "w") as token:
-            token.write(creds.to_json())
-
-    service = build("gmail", "v1", credentials=creds)
-    return service
+    creds = ensure_logged_in_and_get_credentials()
+    if not creds:
+        st.stop()
+    return build("gmail", "v1", credentials=creds)
 
 
 def list_messages(service, query: str = "", max_results: int = 20) -> List[Dict[str, Any]]:
     """
     Liste des messages (id + infos) selon une requête Gmail.
-
-    Exemples de query :
-    - "is:unread"
-    - "from:client"
-    - "subject:TVA"
-    - "has:attachment"
+    Ex: "is:unread", "from:client", "subject:TVA"
     """
     results = (
         service.users()
@@ -121,7 +260,6 @@ def get_email_detail(service, message_id: str) -> Dict[str, Any]:
     date = header_map.get("Date", "")
     snippet = msg.get("snippet", "")
 
-    # Extraction du corps texte
     body = ""
     payload = msg.get("payload", {})
 
@@ -158,30 +296,22 @@ def get_email_detail(service, message_id: str) -> Dict[str, Any]:
 
 
 def get_openai_client() -> OpenAI:
-    """
-    Initialise le client OpenAI à partir des secrets Streamlit.
-    (OPENAI_API_KEY doit être défini dans .streamlit/secrets.toml)
-    """
     api_key = st.secrets.get("OPENAI_API_KEY")
     if not api_key:
         st.error(
             "Clé OpenAI manquante.\n\n"
-            "Ajoute-la dans .streamlit/secrets.toml sous la forme :\n"
-            'OPENAI_API_KEY = "ta_cle_ici"'
+            "Ajoute-la dans les secrets Streamlit :\n"
+            'OPENAI_API_KEY = "sk-..."\n'
         )
         st.stop()
     return OpenAI(api_key=api_key)
 
 
 def summarize_email(email_body: str, language: str = "fr") -> str:
-    """
-    Résume un mail avec l'IA.
-    """
     if not email_body or not email_body.strip():
         return "(Corps du mail vide ou non disponible)"
 
     client = get_openai_client()
-
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -196,7 +326,7 @@ def summarize_email(email_body: str, language: str = "fr") -> str:
                 "role": "user",
                 "content": (
                     f"Résume ce mail en {language} en 5 à 10 lignes max, "
-                    f"avec une petite liste à puces pour les actions à faire :\n\n"
+                    f"avec une liste à puces pour les actions à faire :\n\n"
                     f"{email_body}"
                 ),
             },
@@ -211,9 +341,6 @@ def draft_reply(
     tone: str = "professionnel et bienveillant",
     language: str = "fr",
 ) -> str:
-    """
-    Génère un brouillon de réponse au mail.
-    """
     client = get_openai_client()
 
     prompt = (
@@ -223,7 +350,7 @@ def draft_reply(
         f"Rédige une réponse en {language}, avec un ton {tone}, clair et structuré, "
         f"en restant réaliste (ne promets pas des choses impossibles). "
         f"Ne commence pas directement par 'Bonjour' dans ton texte, "
-        f"je rajouterai la formule de politesse moi-même."
+        f"la formule de politesse sera ajoutée après."
     )
 
     completion = client.chat.completions.create(
@@ -243,35 +370,22 @@ def draft_reply(
 
 
 def transcribe_audio(audio_bytes: bytes, language: str = "fr") -> str:
-    """
-    Transcrit un enregistrement vocal (wav/mp3/ogg) en texte avec Whisper (OpenAI).
-
-    On utilise BytesIO + .name pour être compatible avec l'API.
-    """
     client = get_openai_client()
-
     audio_file = io.BytesIO(audio_bytes)
-    audio_file.name = "message.wav"  # nom symbolique (extension reconnue)
+    audio_file.name = "message.wav"
 
     transcript = client.audio.transcriptions.create(
         model="whisper-1",
         file=audio_file,
-        response_format="text",  # renvoie une simple string
+        response_format="text",
     )
 
-    # Si response_format="text", transcript est déjà une string
     if isinstance(transcript, str):
         return transcript
-
-    # fallback si jamais c'est un objet
     return getattr(transcript, "text", str(transcript))
 
 
 def interpret_voice_instruction(transcribed_text: str) -> str:
-    """
-    Envoie le texte transcrit à l'IA pour le transformer en plan d'action
-    ou en réponse structurée.
-    """
     client = get_openai_client()
 
     completion = client.chat.completions.create(
@@ -281,10 +395,8 @@ def interpret_voice_instruction(transcribed_text: str) -> str:
                 "role": "system",
                 "content": (
                     "Tu aides un expert-comptable à gérer sa boîte mail Gmail. "
-                    "On te fournit une instruction dictée par la voix, déjà transcrite. "
-                    "Réponds de manière structurée en expliquant ce que tu proposes de faire, "
-                    "comme un plan d'action ou une suggestion détaillée, sans exécuter "
-                    "d'actions réelles."
+                    "On te fournit une instruction dictée par la voix (déjà transcrite). "
+                    "Réponds avec un plan d'action clair, sans exécuter d'actions réelles."
                 ),
             },
             {
@@ -301,26 +413,24 @@ def interpret_voice_instruction(transcribed_text: str) -> str:
 # UI STREAMLIT
 # ---------------------------------------------------------------------
 
-st.set_page_config(page_title="Assistant Gmail IA", page_icon="📧", layout="wide")
+st.set_page_config(page_title="Assistant Gmail IA (web)", page_icon="📧", layout="wide")
 
-st.title("📧 Assistant Gmail IA (local / Streamlit)")
+st.title("📧 Assistant Gmail IA – 100% Web")
 
 st.markdown(
     """
-Cet outil te permet de piloter ta boîte Gmail avec l'IA :
+Cette app tourne **sur Streamlit Cloud** et utilise :
 
-- Connexion à ton Gmail via OAuth (lecture seule)
-- Filtrage des mails avec la syntaxe de recherche Gmail
-- Affichage détaillé d'un mail
-- Résumé automatique par IA
-- Proposition de brouillon de réponse
-- 🎙 Enregistrement d'un message vocal et interprétation par l'IA
+- 🔐 OAuth Google (type **Web**) pour accéder à *ton* Gmail (lecture seule)
+- 🤖 OpenAI pour résumer et proposer des réponses
+- 🎙 Un message vocal pour piloter l'assistant
 
-⚠️ Données :
-- Emails récupérés uniquement via l'API Gmail
-- Seul le contenu que tu demandes à traiter est envoyé à OpenAI
+Les tokens Google restent en mémoire de session (pas de fichier local).
 """
 )
+
+# --- Auth Google obligatoire avant de continuer ---
+gmail_service = get_gmail_service()
 
 # ---------------- Sidebar : options ----------------
 
@@ -339,12 +449,10 @@ refresh = st.sidebar.button("🔄 Charger / Rafraîchir les mails")
 if "email_list" not in st.session_state:
     st.session_state.email_list = []
 
-
 # ---------------- Chargement des mails ----------------
 
 if refresh:
     try:
-        gmail_service = get_gmail_service()
         with st.spinner("Récupération des mails depuis Gmail..."):
             st.session_state.email_list = list_messages(
                 gmail_service, query=query, max_results=max_results
@@ -352,7 +460,6 @@ if refresh:
         st.success(f"{len(st.session_state.email_list)} mails chargés.")
     except Exception as e:
         st.error(f"Erreur lors de l'accès à Gmail : {e}")
-
 
 # ---------------- Layout principal ----------------
 
@@ -383,7 +490,6 @@ with col_detail:
     if selected_index is not None:
         selected_msg = st.session_state.email_list[selected_index]
         try:
-            gmail_service = get_gmail_service()
             email_detail = get_email_detail(gmail_service, selected_msg["id"])
         except Exception as e:
             st.error(f"Erreur lors de la récupération du mail : {e}")
@@ -446,15 +552,12 @@ Exemples :
 - *"Résume-moi les trois derniers mails non lus."*
 - *"Propose une réponse au dernier mail de Mme Dupont concernant la TVA."*
 - *"Liste les urgences dans ma boîte de réception."*
-
-💡 L'enregistrement se fait via le micro de ton navigateur.
 """
 )
 
 audio_file = st.audio_input("Enregistre un message vocal")
 
 if audio_file is not None:
-    # Lecture de l'audio dans l'interface
     st.audio(audio_file)
 
     if st.button("🧠 Transcrire et envoyer à l'assistant"):
