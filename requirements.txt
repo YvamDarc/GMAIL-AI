@@ -5,7 +5,5 @@ google-api-python-client
 
 openai
 
-streamlit-audiorecorder
-
 requests
 python-dotenv
