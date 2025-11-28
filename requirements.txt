@@ -1,0 +1,11 @@
+streamlit
+google-auth
+google-auth-oauthlib
+google-api-python-client
+
+openai
+
+streamlit-audiorecorder
+
+requests
+python-dotenv
